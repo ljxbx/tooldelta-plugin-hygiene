@@ -19,15 +19,14 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
-def normalize_response(response: Any, channel: str) -> dict[str, Any]:
-    """将 Packet_CommandOutput、字典或字符串统一为可序列化结构。"""
-    if isinstance(response, str):
-        try:
-            decoded = json.loads(response)
-        except (TypeError, ValueError):
-            decoded = None
-        if isinstance(decoded, dict) and "OutputMessages" in decoded:
-            return normalize_response(decoded, channel)
+def _try_load_json(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_texts_and_success(response: Any) -> tuple[list[str], list[bool]]:
     messages = _field(response, "OutputMessages", []) or []
     if not isinstance(messages, list):
         messages = [messages]
@@ -40,12 +39,11 @@ def normalize_response(response: Any, channel: str) -> dict[str, Any]:
         success = _field(item, "Success", None)
         if isinstance(success, bool):
             success_values.append(success)
-    if isinstance(response, str):
-        texts.append(response)
-    dataset = _field(response, "DataSet", "") or ""
-    if dataset:
-        texts.append(str(dataset))
-    text = "\n".join(texts)
+    return texts, success_values
+
+
+def _decode_block_payloads(text: str) -> list[dict[str, Any]]:
+    """解析 ``###*{...}*###`` 包装的 JSON 负载。"""
     payloads: list[dict[str, Any]] = []
     decoder = json.JSONDecoder()
     for match in _BLOCK_RE.finditer(text):
@@ -59,29 +57,57 @@ def normalize_response(response: Any, channel: str) -> dict[str, Any]:
         marker_end = text.find("*###", start + end)
         if marker_end >= 0 and isinstance(payload, dict):
             payloads.append(payload)
-    # 兼容没有 ###* 包装但直接返回 JSON 的版本。
-    if not payloads:
-        for candidate in texts:
-            try:
-                payload = json.loads(candidate.strip())
-            except (TypeError, ValueError):
-                continue
-            if isinstance(payload, dict):
-                payloads.append(payload)
+    return payloads
+
+
+def _decode_bare_payloads(texts: list[str]) -> list[dict[str, Any]]:
+    """兼容没有 ###* 包装但直接返回 JSON 的版本。"""
+    payloads: list[dict[str, Any]] = []
+    for candidate in texts:
+        payload = _try_load_json(candidate.strip())
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def _resolve_outcome(
+    response: Any,
+    success_values: list[bool],
+    payloads: list[dict[str, Any]],
+    text: str,
+) -> tuple[bool, bool, str | None]:
     success_count = _field(response, "SuccessCount", None)
     confirmed = bool(success_values) and all(success_values)
-    if isinstance(success_count, int) and success_count <= 0:
-        confirmed = False
-    elif isinstance(success_count, int) and success_count > 0:
-        confirmed = True
+    if isinstance(success_count, int):
+        confirmed = success_count > 0
     success = confirmed or bool(payloads)
-    error_code = None
     if "commands.generic.error.permissions" in text:
-        error_code = "permission_denied"
-        success = False
-        confirmed = False
-    elif not success:
-        error_code = "command_failed"
+        return False, False, "permission_denied"
+    if not success:
+        return success, confirmed, "command_failed"
+    return success, confirmed, None
+
+
+def normalize_response(response: Any, channel: str) -> dict[str, Any]:
+    """将 Packet_CommandOutput、字典或字符串统一为可序列化结构。"""
+    if isinstance(response, str):
+        decoded = _try_load_json(response)
+        if isinstance(decoded, dict) and "OutputMessages" in decoded:
+            return normalize_response(decoded, channel)
+
+    texts, success_values = _collect_texts_and_success(response)
+    if isinstance(response, str):
+        texts.append(response)
+    dataset = _field(response, "DataSet", "") or ""
+    if dataset:
+        texts.append(str(dataset))
+    text = "\n".join(texts)
+
+    payloads = _decode_block_payloads(text)
+    if not payloads:
+        payloads = _decode_bare_payloads(texts)
+
+    success, confirmed, error_code = _resolve_outcome(response, success_values, payloads, text)
     return {
         "success": success,
         "confirmed": confirmed,

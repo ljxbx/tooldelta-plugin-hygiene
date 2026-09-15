@@ -10,8 +10,6 @@ from typing import Any
 
 class StateStore:
     _KEYS = {
-        "desired": "期望权限",
-        "observed_admins": "已发现管理员",
         "operations": "操作记录",
         "snapshots": "权限快照",
         "last_list_time": "最近列表时间",
@@ -127,7 +125,7 @@ class StateStore:
         self._migrate_legacy_files()
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError, OSError, TypeError):
+        except (ValueError, OSError, TypeError):
             data = {}
         if not isinstance(data, dict):
             data = {}

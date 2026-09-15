@@ -115,77 +115,112 @@ class ConsoleMenuMixin:
         self._console_print(self._BORDER)
         return results
 
-    def _select_player_interactive(self, flags: str) -> bool:
-        query = self._console_input("请输入玩家名称或 XUID（! 返回，q 退出）：")
-        if query is None:
+    def _ask(self, prompt: str) -> tuple[bool, str]:
+        """读取一行输入，统一处理超时、``q`` 退出和 ``!`` 返回。
+
+        返回 ``(是否继续, 输入内容)``；第一个元素为 ``False`` 时调用方应直接返回。
+        """
+        value = self._console_input(prompt)
+        if value is None:
             if self._input_timed_out:
                 self._orion("WARN", "输入超时")
-            return False
-        if query.lower() == "q":
+            return False, ""
+        if value.lower() == "q":
             self._close_menu()
-            return False
-        if query in {"!", "！"}:
-            return False
+            return False, ""
+        if value in {"!", "！"}:
+            return False, ""
+        return True, value
+
+    def _confirm_yes(self, prompt: str) -> bool | None:
+        """确认类输入：``True`` 确认、``False`` 取消、``None`` 需中断当前流程。"""
+        ok, value = self._ask(prompt)
+        if not ok:
+            return None
+        return value.lower() == "y"
+
+    def _read_token(self, prompt: str) -> tuple[str, str]:
+        """读取一行并归一化控制指令，返回 ``(状态, 输入值)``。
+
+        状态取值：``ok`` 正常输入、``back`` 输入 ``!`` 返回上一级、``closed``
+        超时或输入 ``q``（两种情况都会关闭菜单）。
+        """
+        value = self._console_input(prompt)
+        if value is None:
+            if self._input_timed_out:
+                self._orion("WARN", "输入超时")
+            self._close_menu()
+            return "closed", ""
+        if value.lower() == "q":
+            self._close_menu()
+            return "closed", ""
+        if value in {"!", "！"}:
+            return "back", ""
+        return "ok", value
+
+    def _player_is_managed(self, normalized: str) -> bool:
+        """判断玩家是否处于持续管理状态，兼容旧版布尔与字典两种存储。"""
+        managed = self.state.get("持续管理玩家", {}).get(normalized, False)
+        if isinstance(managed, dict):
+            managed = managed.get("是否启用", managed.get("启用", True))
+        return bool(managed)
+
+    def _pick_player(self, prompt: str) -> dict[str, str] | None:
+        """按名称/XUID 或搜索结果编号选定一个玩家。"""
+        ok, query = self._ask(prompt)
+        if not ok:
+            return None
         try:
             results = [{"xuid": normalize_xuid(query), "name": query}]
         except ValueError:
             results = self._show_player_results(query)
         if not results:
-            return False
-        choice = self._console_input("请输入编号（! 返回，q 退出）：")
-        if choice is None:
-            if self._input_timed_out:
-                self._orion("WARN", "输入超时")
-            return False
-        if choice.lower() == "q":
-            self._close_menu()
-            return False
-        if choice in {"!", "！"}:
-            return False
+            return None
+        ok, choice = self._ask("请输入编号（! 返回，q 退出）：")
+        if not ok:
+            return None
         if not choice.isdigit() or not 1 <= int(choice) <= len(results):
             self._orion("ALERT", "无效的玩家编号")
-            return False
-        target = results[int(choice) - 1]
+            return None
+        return results[int(choice) - 1]
+
+    def _show_set_options(self, target: dict[str, str], flags: str) -> None:
         self._console_print(self._BORDER)
-        normalized = target["xuid"].lower()
-        managed = self.state.get("持续管理玩家", {}).get(normalized, False)
-        if isinstance(managed, dict):
-            managed = managed.get("是否启用", managed.get("启用", True))
         self._console_print(f"§a❀ §b将设置 §e{target['name']}§b（{target['xuid']}）为 §e{flags}")
         self._console_print("§a❀ §b[ §e1§b ] 仅设置本次权限")
         self._console_print("§a❀ §b[ §e2§b ] 设置并持续管理")
-        if managed:
+        if self._player_is_managed(target["xuid"].lower()):
             self._console_print("§6❀ §b该玩家已启用持续管理，选择 1 将被拒绝；可先暂停管理")
-        mode_choice = self._console_input("请输入设置方式（! 返回，q 退出）：")
-        if mode_choice is None:
-            if self._input_timed_out:
-                self._orion("WARN", "输入超时")
+
+    def _report_set_result(self, target: dict[str, str], flags: str, result: dict[str, Any]) -> None:
+        if result.get("success"):
+            self._orion("OK", f"已设置 {target['xuid']} -> {flags}")
+        else:
+            self._orion("ALERT", result.get("message", "设置失败"))
+
+    def _select_player_interactive(self, flags: str) -> bool:
+        target = self._pick_player("请输入玩家名称或 XUID（! 返回，q 退出）：")
+        if target is None:
             return False
-        if mode_choice.lower() == "q":
-            self._close_menu()
+        self._show_set_options(target, flags)
+        ok, mode_choice = self._ask("请输入设置方式（! 返回，q 退出）：")
+        if not ok:
             return False
-        if mode_choice in {"!", "！"}:
-            return False
-        if mode_choice not in {"1", "2"}:
+        management = {"1": "once", "2": "manage"}.get(mode_choice)
+        if management is None:
             self._orion("ALERT", "无效的设置方式")
             return True
-        management = "manage" if mode_choice == "2" else "once"
         self._console_print("§a❀ §b输入 §ey§b 确认，输入 §e!§b 返回，输入 §cq§b 退出")
-        confirm = self._console_input("请输入确认：")
-        if confirm is None:
-            if self._input_timed_out:
-                self._orion("WARN", "输入超时")
+        confirmed = self._confirm_yes("请输入确认：")
+        if confirmed is None:
             return False
-        if confirm.lower() == "q":
-            self._close_menu()
-            return False
-        if confirm in {"!", "！"}:
-            return False
-        if confirm.lower() != "y":
+        if not confirmed:
             self._orion("WARN", "未确认，本次操作已取消")
             return True
-        result = self.set_permission(target["xuid"], flags, actor="console", management=management)
-        self._orion("OK" if result.get("success") else "ALERT", f"已设置 {target['xuid']} -> {flags}" if result.get("success") else result.get("message", "设置失败"))
+        result = self.set_permission(
+            target["xuid"], flags, actor="console", management=management
+        )
+        self._report_set_result(target, flags, result)
         return True
 
     def _snapshot_page_size(self) -> int:
@@ -207,6 +242,39 @@ class ConsoleMenuMixin:
         self._console_print(f"§a❀ §b期望权限：§e{len(desired)} 个")
         self._console_print(self._BORDER)
 
+    def _render_snapshot_page(self, items: dict[str, Any], operation: str, page: int) -> None:
+        title = "还原" if operation == "restore" else "删除"
+        self._console_print(self._BORDER)
+        self._console_print(f"§l§d❐§f 『§6Libra-天秤座§f』 快照{title}列表 §7第 {page} 页")
+        for index, item in enumerate(items.get("项目", []), 1):
+            snapshot = item["快照"]
+            name = snapshot.get("名称") or snapshot.get("name") or "未命名快照"
+            desired = snapshot.get("期望权限", snapshot.get("desired", {})) or {}
+            self._console_print(f"§l§b[ §e{index}§b ] §r§e{name} §7({len(desired)} 个权限)")
+        self._console_print(self._BORDER)
+        self._console_print("§a❀ §b输入序号选择，n 下一页，p 上一页，输入关键词查找，! 返回，q 退出")
+
+    def _snapshot_operate(self, operation: str, selected: dict[str, Any]) -> str:
+        """确认并执行单个快照的还原/删除，返回 ``done`` / ``back`` / ``closed``。"""
+        self._snapshot_detail(selected)
+        verb = "还原" if operation == "restore" else "删除"
+        status, confirm = self._read_token(f"确认{verb}此快照？输入 y 确认，! 返回，q 退出：")
+        if status in {"closed", "back"}:
+            return status
+        if confirm.lower() != "y":
+            self._orion("WARN", "未确认，本次操作已取消")
+            return "done"
+        index = int(selected["索引"])
+        if operation == "restore":
+            result = self.restore_snapshot(index, actor="console")
+        else:
+            result = self.delete_snapshot(index, actor="console")
+        if result.get("success"):
+            self._orion("OK", f"快照{verb}完成")
+        else:
+            self._orion("ALERT", result.get("error", "操作失败"))
+        return "done"
+
     def _choose_snapshot(self, operation: str) -> str:
         page = 1
         query = ""
@@ -214,58 +282,24 @@ class ConsoleMenuMixin:
         while self._menu != "closed":
             items = self.list_snapshots(page=page, page_size=page_size, query=query)
             total = items.get("总数", 0)
-            self._console_print(self._BORDER)
-            title = "还原" if operation == "restore" else "删除"
-            self._console_print(f"§l§d❐§f 『§6Libra-天秤座§f』 快照{title}列表 §7第 {page} 页")
-            for index, item in enumerate(items.get("项目", []), 1):
-                snapshot = item["快照"]
-                name = snapshot.get("名称") or snapshot.get("name") or "未命名快照"
-                desired = snapshot.get("期望权限", snapshot.get("desired", {})) or {}
-                self._console_print(f"§l§b[ §e{index}§b ] §r§e{name} §7({len(desired)} 个权限)")
-            self._console_print(self._BORDER)
-            self._console_print("§a❀ §b输入序号选择，n 下一页，p 上一页，输入关键词查找，! 返回，q 退出")
-            choice = self._console_input("请输入选项：")
-            if choice is None:
-                if self._input_timed_out:
-                    self._orion("WARN", "输入超时")
-                self._close_menu()
-                return "closed"
-            if choice.lower() == "q":
-                self._close_menu()
-                return "closed"
-            if choice in {"!", "！"}:
-                return "back"
-            if choice.lower() == "n":
+            self._render_snapshot_page(items, operation, page)
+            status, choice = self._read_token("请输入选项：")
+            if status in {"closed", "back"}:
+                return status
+            lowered = choice.lower()
+            if lowered == "n":
                 if page * page_size < total:
                     page += 1
                 continue
-            if choice.lower() == "p":
+            if lowered == "p":
                 page = max(1, page - 1)
                 continue
             entries = items.get("项目", [])
             if choice.isdigit() and 1 <= int(choice) <= len(entries):
-                selected = entries[int(choice) - 1]
-                self._snapshot_detail(selected)
-                prompt = "确认还原此快照？输入 y 确认，! 返回，q 退出：" if operation == "restore" else "确认删除此快照？输入 y 确认，! 返回，q 退出："
-                confirm = self._console_input(prompt)
-                if confirm is None:
-                    if self._input_timed_out:
-                        self._orion("WARN", "输入超时")
-                    self._close_menu()
-                    return "closed"
-                if confirm.lower() == "q":
-                    self._close_menu()
-                    return "closed"
-                if confirm in {"!", "！"}:
+                outcome = self._snapshot_operate(operation, entries[int(choice) - 1])
+                if outcome == "back":
                     continue
-                if confirm.lower() == "y":
-                    index = int(selected["索引"])
-                    result = self.restore_snapshot(index, actor="console") if operation == "restore" else self.delete_snapshot(index, actor="console")
-                    message = "快照还原完成" if operation == "restore" else "快照删除完成"
-                    self._orion("OK" if result.get("success") else "ALERT", message if result.get("success") else result.get("error", "操作失败"))
-                    return "done"
-                self._orion("WARN", "未确认，本次操作已取消")
-                return "done"
+                return outcome
             query = choice.strip()
             page = 1
         return "closed"
@@ -299,43 +333,32 @@ class ConsoleMenuMixin:
             return False
         return value.lower() == "y"
 
-    def _manage_realtime_player(self) -> None:
-        query = self._console_input("请输入玩家名称或 XUID（! 返回，q 退出）：")
-        if query is None:
-            if self._input_timed_out:
-                self._orion("WARN", "输入超时")
-            return
-        if query.lower() == "q":
-            self._close_menu()
-            return
-        if query in {"!", "！"}:
-            return
+    def _pick_manage_target(self, query: str) -> dict[str, str] | None:
+        """把控制台输入解析为 ``{xuid, name}``；无法确定唯一玩家时返回 ``None``。"""
         try:
             normalized = normalize_xuid(query)
-            target = {"xuid": normalized, "name": self.resolve_player_name(normalized) or query}
         except ValueError:
             matches = self._show_player_results(query)
             if not matches:
-                return
-            choice = self._console_input("请输入编号（! 返回，q 退出）：")
-            if choice is None:
-                if self._input_timed_out:
-                    self._orion("WARN", "输入超时")
-                return
-            if choice.lower() == "q":
-                self._close_menu()
-                return
-            if choice in {"!", "！"} or not choice.isdigit() or not 1 <= int(choice) <= len(matches):
+                return None
+            status, choice = self._ask("请输入编号（! 返回，q 退出）：")
+            if not status:
+                return None
+            if not choice.isdigit() or not 1 <= int(choice) <= len(matches):
                 self._orion("ALERT", "无效的玩家编号")
-                return
-            target = matches[int(choice) - 1]
-        flags = self._console_input("请输入 8 位目标权限（0/1）：")
-        if flags is None:
-            if self._input_timed_out:
-                self._orion("WARN", "输入超时")
+                return None
+            return matches[int(choice) - 1]
+        return {"xuid": normalized, "name": self.resolve_player_name(normalized) or query}
+
+    def _manage_realtime_player(self) -> None:
+        status, query = self._ask("请输入玩家名称或 XUID（! 返回，q 退出）：")
+        if not status:
             return
-        if flags.lower() == "q":
-            self._close_menu()
+        target = self._pick_manage_target(query)
+        if target is None:
+            return
+        status, flags = self._ask("请输入 8 位目标权限（0/1）：")
+        if not status:
             return
         try:
             parse_flags(flags)
@@ -343,155 +366,196 @@ class ConsoleMenuMixin:
             self._orion("ALERT", str(exc))
             return
         self._console_print(f"§a❀ §b将为 §e{target['name']}§b 建立持续规则：§e{flags}")
-        confirmed = self._realtime_confirm("请输入 y 确认，! 返回，q 退出：")
-        if confirmed is True:
-            result = self.realtime.set_managed_rule(target["xuid"], flags, actor="console")
-            self._orion("OK" if result.get("success") else "ALERT", "持续管理规则已保存" if result.get("success") else result.get("message", "规则保存失败"))
+        if self._realtime_confirm("请输入 y 确认，! 返回，q 退出：") is not True:
+            return
+        result = self.realtime.set_managed_rule(target["xuid"], flags, actor="console")
+        if result.get("success"):
+            self._orion("OK", "持续管理规则已保存")
+        else:
+            self._orion("ALERT", result.get("message", "规则保存失败"))
+
+    def _realtime_show_status(self) -> None:
+        status = self.realtime.status()
+        state = "运行中" if status["是否运行"] else "未运行"
+        self._orion(
+            "OK",
+            f"实时管理：{state}，在线玩家 {status['在线玩家数']} 个，"
+            f"观测 {status['权限观测数']} 个（已就绪 {status['已就绪观测数']} 个），"
+            f"最近修正 {status['最近修正数量']} 条",
+        )
+
+    def _realtime_toggle(self) -> None:
+        current = self.realtime.enabled()
+        prompt = f"当前为{'启用' if current else '停用'}，确认切换？输入 y 确认："
+        if self._realtime_confirm(prompt) is not True:
+            return
+        status = self.realtime.set_enabled(not current)
+        self._orion("OK", f"实时管理已{'启用' if status['是否启用'] else '停用'}")
+
+    @staticmethod
+    def _permission_category(flags: Any) -> str:
+        """把 8 位权限串归类为访客/成员/管理员/自定义，非法值归为未知。"""
+        if not isinstance(flags, str) or len(flags) != 8 or any(c not in "01" for c in flags):
+            return "未知"
+        if flags == "00000000":
+            return "访客"
+        if flags == "11111100":
+            return "成员"
+        if flags == "11111111":
+            return "管理员"
+        return "自定义"
+
+    def _realtime_show_online(self) -> None:
+        for record in self.realtime.inspect_players():
+            name = record.get("玩家名称", record.get("玩家名", "未知玩家"))
+            xuid = str(record.get("XUID", "")).lower()
+            flags = record.get("实际权限")
+            category = self._permission_category(flags)
+            shown = flags if category != "未知" else "未知"
+            managed = "是" if self._player_is_managed(xuid) else "否"
+            self._orion("SCAN", f"{name}：{managed} {category} {shown}")
+
+    def _realtime_run_check(self) -> None:
+        records = self.realtime.inspect_players()
+        self._orion("SCAN", f"立即检查完成，共处理 {len(records)} 个在线玩家")
+
+    def _realtime_show_recent_fixes(self) -> None:
+        rows = self.realtime.recent_fix_records(self._snapshot_page_size())
+        if not rows:
+            self._orion("OK", "暂无实时权限修正记录")
+            return
+        for row in rows:
+            name = row.get("玩家名称", row.get("玩家XUID"))
+            self._orion(
+                "SCAN",
+                f"{name}：{row.get('实际权限')} -> {row.get('目标权限')}，{row.get('状态')}",
+            )
+
+    def _realtime_set_unauthorized_policy(self) -> None:
+        self._console_print("§a❀ §b[ §e0§b ] 仅提醒  §b[ §e1§b ] 设为成员  §b[ §e2§b ] 设为访客")
+        policy = self._console_input("请输入处理方式：")
+        values = {"0": (0, "仅提醒"), "1": (1, "设为成员"), "2": (2, "设为访客")}
+        if policy not in values:
+            self._orion("ALERT", "无效的处理方式")
+            return
+        number, label = values[policy]
+        key = "未授权管理员处理(0:仅提醒,1:设为成员,2:设为访客)"
+        self.cfg.setdefault("实时管理", {})[key] = number
+        self._save_config()
+        self._orion("OK", f"未授权管理员处理已设置为：{number}（{label}）")
 
     def _run_realtime_menu(self, choice: str) -> bool:
-        if choice == "1":
-            status = self.realtime.status()
-            self._orion("OK", f"实时管理：{'运行中' if status['是否运行'] else '未运行'}，在线玩家 {status['在线玩家数']} 个，观测 {status['权限观测数']} 个（已就绪 {status['已就绪观测数']} 个），最近修正 {status['最近修正数量']} 条")
-        elif choice == "2":
-            current = self.realtime.enabled()
-            confirmed = self._realtime_confirm(f"当前为{'启用' if current else '停用'}，确认切换？输入 y 确认：")
-            if confirmed is True:
-                status = self.realtime.set_enabled(not current)
-                self._orion("OK", f"实时管理已{'启用' if status['是否启用'] else '停用'}")
-        elif choice == "3":
-            records = self.realtime.inspect_players()
-            for record in records:
-                name = record.get("玩家名称", record.get("玩家名", "未知玩家"))
-                xuid = str(record.get("XUID", "")).lower()
-                managed = self.state.get("持续管理玩家", {}).get(xuid, False)
-                if isinstance(managed, dict):
-                    managed = managed.get("是否启用", managed.get("启用", True))
-                flags = record.get("实际权限")
-                if not isinstance(flags, str) or len(flags) != 8 or any(c not in "01" for c in flags):
-                    flags = "未知"
-                    category = "未知"
-                elif flags == "00000000":
-                    category = "访客"
-                elif flags == "11111100":
-                    category = "成员"
-                elif flags == "11111111":
-                    category = "管理员"
-                else:
-                    category = "自定义"
-                managed_text = "是" if managed else "否"
-                self._orion("SCAN", f"{name}：{managed_text} {category} {flags}")
-        elif choice == "4":
-            self._manage_realtime_player()
-        elif choice == "5":
-            records = self.realtime.inspect_players()
-            self._orion("SCAN", f"立即检查完成，共处理 {len(records)} 个在线玩家")
-        elif choice == "6":
-            rows = self.realtime._runtime().get("最近权限修正", [])[-self._snapshot_page_size():]
-            if not rows:
-                self._orion("OK", "暂无实时权限修正记录")
-            for row in rows:
-                self._orion("SCAN", f"{row.get('玩家名称', row.get('玩家XUID'))}：{row.get('实际权限')} -> {row.get('目标权限')}，{row.get('状态')}")
-        elif choice == "7":
-            self._console_print("§a❀ §b[ §e0§b ] 仅提醒  §b[ §e1§b ] 设为成员  §b[ §e2§b ] 设为访客")
-            policy = self._console_input("请输入处理方式：")
-            values = {"0": (0, "仅提醒"), "1": (1, "设为成员"), "2": (2, "设为访客")}
-            if policy in values:
-                number, label = values[policy]
-                self.cfg.setdefault("实时管理", {})["未授权管理员处理(0:仅提醒,1:设为成员,2:设为访客)"] = number
-                self._save_config()
-                self._orion("OK", f"未授权管理员处理已设置为：{number}（{label}）")
-            else:
-                self._orion("ALERT", "无效的处理方式")
-        else:
+        handlers = {
+            "1": self._realtime_show_status,
+            "2": self._realtime_toggle,
+            "3": self._realtime_show_online,
+            "4": self._manage_realtime_player,
+            "5": self._realtime_run_check,
+            "6": self._realtime_show_recent_fixes,
+            "7": self._realtime_set_unauthorized_policy,
+        }
+        handler = handlers.get(choice)
+        if handler is None:
             self._orion("HELP", "请输入实时管理菜单中的数字序号")
+        else:
+            handler()
         if self._menu != "closed":
             return self._finish_or_timeout()
         return False
+
+    def _console_main_menu(self, choice: str) -> bool:
+        """处理主菜单选项；返回 ``False`` 表示需要退出控制台菜单。"""
+        action, _ = menu_action("main", choice)
+        if action == "status":
+            mode = "魔法指令模式" if self._use_magic_command() else "普通指令模式"
+            admins = len(self.state.get("已发现管理员", []))
+            desired = len(self.state.get("期望权限", {}))
+            self._orion("OK", f"缓存管理员 {admins} 个，期望权限 {desired} 个，当前为{mode}")
+        elif action == "list":
+            self._run_list()
+        elif action in {"set_menu", "snapshot_menu", "realtime_menu"}:
+            self._menu = {
+                "set_menu": "set",
+                "snapshot_menu": "snapshots",
+                "realtime_menu": "realtime",
+            }[action]
+            return True
+        else:
+            self._orion("HELP", "请输入菜单中的数字序号")
+        return self._finish_or_timeout()
+
+    def _console_set_custom(self) -> bool:
+        """读取自定义权限串并进入玩家选择；返回 ``False`` 表示需要退出菜单。"""
+        status, custom = self._read_token("请输入 8 位权限标志（0/1）：")
+        if status == "closed":
+            return False
+        if status == "ok":
+            try:
+                parse_flags(custom)
+            except ValueError as exc:
+                self._orion("ALERT", str(exc))
+                return True
+            self._select_player_interactive(custom)
+        return True
+
+    def _console_set_menu(self, choice: str) -> bool:
+        action, flags = menu_action("set", choice)
+        if action in {"set_admin", "set_member", "set_guest"}:
+            self._select_player_interactive(flags or "00000000")
+        elif action == "set_custom":
+            if not self._console_set_custom():
+                return False
+        else:
+            self._orion("HELP", "请选择 1-4，或输入 ! 返回")
+        if self._menu == "closed":
+            return False
+        return self._finish_or_timeout()
+
+    def _console_snapshots_menu(self, choice: str) -> bool:
+        action, _ = menu_action("snapshots", choice)
+        if action == "snapshot_create":
+            self._create_snapshot_interactive()
+            if self._menu == "closed":
+                return False
+            return self._finish_or_timeout()
+        if action not in {"snapshot_restore", "snapshot_delete"}:
+            self._orion("HELP", "请选择 1-3，或输入 ! 返回")
+            return True
+        operation = "restore" if action == "snapshot_restore" else "delete"
+        result = self._choose_snapshot(operation)
+        if result == "closed":
+            return False
+        if result == "done":
+            return self._finish_or_timeout()
+        return True
+
+    def _dispatch_console_choice(self, choice: str) -> bool:
+        """按当前菜单层级分派输入；返回 ``False`` 表示需要退出控制台菜单。"""
+        if self._menu == "main":
+            return self._console_main_menu(choice)
+        if self._menu == "set":
+            return self._console_set_menu(choice)
+        if self._menu == "snapshots":
+            return self._console_snapshots_menu(choice)
+        if self._menu == "realtime":
+            return self._run_realtime_menu(choice)
+        return True
 
     def _run_console_menu(self) -> None:
         self._menu = "main"
         self._pending = None
         while self._menu != "closed":
             self._render_menu(self._menu)
-            choice = self._console_input("请输入选项：")
-            if choice is None:
-                if self._input_timed_out:
-                    self._orion("WARN", "输入超时")
-                self._close_menu()
+            status, choice = self._read_token("请输入选项：")
+            if status == "closed":
                 return
-            if choice.lower() == "q":
-                self._close_menu()
-                return
-            if choice in {"!", "！"}:
+            if status == "back":
                 if self._menu == "main":
                     self._close_menu()
                     return
                 self._menu = "main"
                 continue
-            if self._menu == "main":
-                action, _ = menu_action("main", choice)
-                if action == "status":
-                    mode = "魔法指令模式" if self._use_magic_command() else "普通指令模式"
-                    self._orion("OK", f"缓存管理员 {len(self.state.get('已发现管理员', []))} 个，期望权限 {len(self.state.get('期望权限', {}))} 个，当前为{mode}")
-                elif action == "list":
-                    self._run_list()
-                elif action == "set_menu":
-                    self._menu = "set"
-                    continue
-                elif action == "snapshot_menu":
-                    self._menu = "snapshots"
-                    continue
-                elif action == "realtime_menu":
-                    self._menu = "realtime"
-                    continue
-                else:
-                    self._orion("HELP", "请输入菜单中的数字序号")
-                if not self._finish_or_timeout():
-                    return
-                continue
-            if self._menu == "set":
-                action, flags = menu_action("set", choice)
-                if action in {"set_admin", "set_member", "set_guest"}:
-                    self._select_player_interactive(flags or "00000000")
-                elif action == "set_custom":
-                    custom = self._console_input("请输入 8 位权限标志（0/1）：")
-                    if custom is None:
-                        if self._input_timed_out:
-                            self._orion("WARN", "输入超时")
-                        self._close_menu()
-                        return
-                    if custom.lower() == "q":
-                        self._close_menu()
-                        return
-                    if custom not in {"!", "！"}:
-                        try:
-                            parse_flags(custom)
-                            self._select_player_interactive(custom)
-                        except ValueError as exc:
-                            self._orion("ALERT", str(exc))
-                else:
-                    self._orion("HELP", "请选择 1-4，或输入 ! 返回")
-                if self._menu != "closed" and not self._finish_or_timeout():
-                    return
-                continue
-            if self._menu == "snapshots":
-                action, _ = menu_action("snapshots", choice)
-                if action == "snapshot_create":
-                    self._create_snapshot_interactive()
-                    if self._menu != "closed" and not self._finish_or_timeout():
-                        return
-                elif action in {"snapshot_restore", "snapshot_delete"}:
-                    result = self._choose_snapshot("restore" if action == "snapshot_restore" else "delete")
-                    if result == "done" and not self._finish_or_timeout():
-                        return
-                    if result == "closed":
-                        return
-                else:
-                    self._orion("HELP", "请选择 1-3，或输入 ! 返回")
-                continue
-            if self._menu == "realtime":
-                if self._run_realtime_menu(choice):
-                    continue
+            if not self._dispatch_console_choice(choice):
                 return
 
     def on_menu_token(self, token: str, args: list[str] | None = None) -> None:

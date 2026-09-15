@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import inspect
-import threading
 import time
 from datetime import datetime
 from typing import Any
@@ -100,18 +99,55 @@ class PermissionService:
                 self._orion("ADMIN", label)
         return admins
 
+    def _managed_player_conflict(self, normalized: str) -> dict[str, Any] | None:
+        """持续管理中的玩家不接受一次性设置，返回拒绝结果；否则返回 None。"""
+        realtime_cfg = self.cfg.get("实时管理", {}) if hasattr(self, "cfg") else {}
+        realtime_enabled = isinstance(realtime_cfg, dict) and bool(
+            realtime_cfg.get("是否启用", False)
+        )
+        if not realtime_enabled or not hasattr(self, "state"):
+            return None
+        managed = self.state.get("持续管理玩家", {})
+        active = managed.get(normalized) if isinstance(managed, dict) else False
+        if isinstance(active, dict):
+            active = active.get("是否启用", active.get("启用", True))
+        if not active:
+            return None
+        return {
+            "success": False,
+            "error": "managed_player",
+            "message": "该玩家已启用持续管理，请先暂停管理或更新持续规则",
+            "xuid": normalized,
+        }
+
+    def _write_permission_state(
+        self,
+        normalized: str,
+        flags: str,
+        actor: str,
+        reason: str,
+        management: str,
+        output: dict[str, Any],
+    ) -> None:
+        record = {"xuid": normalized, "flags": flags, "actor": actor, "reason": reason}
+        with self._lock:
+            if management != "auto":
+                self.state.setdefault("期望权限", {})[normalized] = flags
+            if management == "manage":
+                self.state.setdefault("持续管理玩家", {})[normalized] = True
+            self.state.setdefault("操作记录", []).append(
+                {"操作": "设置权限", **record, "响应": output}
+            )
+            self.state["操作记录"] = self.state["操作记录"][-1000:]
+            self._save_state()
+
     def set_permission(self, xuid: str, flags: str, actor: str = "api", reason: str = "", management: str = "once") -> dict[str, Any]:
         normalized = normalize_xuid(xuid)
         parsed = parse_flags(flags)
-        realtime_cfg = self.cfg.get("实时管理", {}) if hasattr(self, "cfg") else {}
-        realtime_enabled = isinstance(realtime_cfg, dict) and bool(realtime_cfg.get("是否启用", False))
-        if management == "once" and realtime_enabled and hasattr(self, "state"):
-            managed = self.state.get("持续管理玩家", {})
-            active = managed.get(normalized) if isinstance(managed, dict) else False
-            if isinstance(active, dict):
-                active = active.get("是否启用", active.get("启用", True))
-            if active:
-                return {"success": False, "error": "managed_player", "message": "该玩家已启用持续管理，请先暂停管理或更新持续规则", "xuid": normalized}
+        if management == "once":
+            conflict = self._managed_player_conflict(normalized)
+            if conflict is not None:
+                return conflict
         command = build_set_command(normalized, parsed.raw)
         if not self._mutation_lock.acquire(blocking=False):
             return {"success": False, "error": "busy", "message": "已有权限变更正在执行"}
@@ -127,16 +163,16 @@ class PermissionService:
             message = "当前命令模式没有 permission 权限" if error == "permission_denied" else "权限设置命令执行失败"
             self._audit("设置权限失败", xuid=normalized, flags=parsed.raw, actor=actor, error=error, response=output)
             return {"success": False, "error": error, "message": message, "xuid": normalized, "response": output}
-        record = {"xuid": normalized, "flags": parsed.raw, "actor": actor, "reason": reason}
-        with self._lock:
-            if management != "auto":
-                self.state.setdefault("期望权限", {})[normalized] = parsed.raw
-            if management == "manage":
-                self.state.setdefault("持续管理玩家", {})[normalized] = True
-            self.state.setdefault("操作记录", []).append({"操作": "设置权限", **record, "响应": output})
-            self.state["操作记录"] = self.state["操作记录"][-1000:]
-            self._save_state()
-        self._audit("设置权限", 命令=command, 响应=output, **record)
+        self._write_permission_state(normalized, parsed.raw, actor, reason, management, output)
+        self._audit(
+            "设置权限",
+            命令=command,
+            响应=output,
+            xuid=normalized,
+            flags=parsed.raw,
+            actor=actor,
+            reason=reason,
+        )
         return {"success": True, "action": "set", "xuid": normalized, "flags": parsed.raw, "response": output}
 
     def revoke_permission(self, xuid: str, actor: str = "api", reason: str = "") -> dict[str, Any]:

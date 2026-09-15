@@ -10,7 +10,10 @@ except ImportError:  # pragma: no cover
     Plugin = object  # type: ignore
     ToolDelta = Any  # type: ignore
     cfg = None  # type: ignore
-    plugin_entry = lambda cls, *args: cls  # type: ignore
+
+    def plugin_entry(cls, *args):  # type: ignore[misc]
+        """ToolDelta 不可用时的占位实现，直接返回插件类。"""
+        return cls
 
 try:
     from .config import ConfigManager
@@ -81,6 +84,36 @@ class ServerPermissionManager(ConsoleMenuMixin, PermissionService, IdentityIndex
         if cfg is not None and hasattr(cfg, "upgrade_plugin_config"):
             cfg.upgrade_plugin_config(self.name, self.cfg, self.version)
 
+    # ------------------------------------------------------------------
+    # 协作组件的公开接口。
+    # RealtimeManager 等内部组件不应直接访问下划线前缀的成员，
+    # 统一从这里进入，保持封装边界清晰。
+    # ------------------------------------------------------------------
+    def save_state(self) -> None:
+        """持久化当前状态。"""
+        self._save_state()
+
+    def audit_event(self, event: str, **details: Any) -> None:
+        """写入一条审计日志。"""
+        self._audit(event, **details)
+
+    def log_orion(self, tag: str, message: str) -> None:
+        """按 Orion 风格输出一条控制台消息。"""
+        self._orion(tag, message)
+
+    def save_config(self) -> None:
+        """把当前配置写回 ToolDelta 配置系统。"""
+        self._save_config()
+
+    def run_admin_list(self, show: bool = False) -> list[str]:
+        """读取服务器管理员列表。"""
+        return self._run_list(show=show)
+
+    @property
+    def state_lock(self) -> Any:
+        """状态读写锁，供协作组件在同一把锁下操作。"""
+        return self._lock
+
     def on_preload(self) -> None:
         try:
             self.xuid_api = self.GetPluginAPI("XUID获取", (0, 0, 7))
@@ -133,12 +166,18 @@ class ServerPermissionManager(ConsoleMenuMixin, PermissionService, IdentityIndex
     pause_managed_rule = RealtimeManager.pause_managed_rule
     remove_managed_rule = RealtimeManager.remove_managed_rule
     list_online_permissions = RealtimeManager.list_online_permissions
-    get_permission_fix_history = lambda self, limit=100: list(self.state.get("实时管理", {}).get("最近权限修正", []))[-max(0, int(limit)):]
     get_realtime_status = RealtimeManager.status
     set_realtime_enabled = RealtimeManager.set_enabled
     subscribe_permission_events = RealtimeManager.subscribe
     subscribe_unknown_admin_events = RealtimeManager.subscribe_unknown_admin
     unsubscribe_permission_events = RealtimeManager.unsubscribe
+
+    def get_permission_fix_history(self, limit: int = 100) -> list[Any]:
+        """返回最近的权限修正记录（对外稳定 API）。"""
+        records = self.state.get("实时管理", {}).get("最近权限修正", [])
+        if not isinstance(records, list):
+            return []
+        return list(records)[-max(0, int(limit)):]
 
     def get_player_permissions(self, xuid: str) -> dict[str, Any] | None:
         try:

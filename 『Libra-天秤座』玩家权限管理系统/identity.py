@@ -9,6 +9,9 @@ except ImportError:
 
 
 class IdentityIndex:
+    # 由 _refresh_identity_index() 写入，在此声明以便静态检查识别该实例属性。
+    _identity_records: dict[str, str]
+
     def _refresh_identity_index(self) -> dict[str, str]:
         records: dict[str, str] = {}
         base = os.path.dirname(str(self.data_path))

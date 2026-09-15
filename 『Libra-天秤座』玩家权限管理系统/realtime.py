@@ -68,7 +68,7 @@ class RealtimeManager:
                 continue
             current.setdefault(xuid, player)
 
-        lock = getattr(self.owner, "_lock", self._lock)
+        lock = getattr(self.owner, "state_lock", self._lock)
         with lock:
             runtime = self._runtime()
             old_online = runtime.get("在线玩家", {})
@@ -121,7 +121,7 @@ class RealtimeManager:
     def _emit(self, event: str, **details: Any) -> None:
         payload = {"事件": event, "时间": int(time.time()), **details}
         try:
-            self.owner._audit(event, **details)
+            self.owner.audit_event(event, **details)
         except Exception:
             pass
         for callback in list(self._callbacks.values()):
@@ -141,7 +141,7 @@ class RealtimeManager:
         runtime["在线玩家"][xuid] = {"玩家名称": name, "最后检查时间": int(time.time())}
         if not observed["就绪"]:
             runtime["权限观测"][xuid] = {"玩家名称": name, "就绪": False, "触发原因": trigger}
-            self.owner._save_state()
+            self.owner.save_state()
             return {"状态": "能力未就绪", "XUID": xuid, "玩家名": name}
         record = {
             "玩家名称": name,
@@ -155,13 +155,13 @@ class RealtimeManager:
         runtime["权限观测"][xuid] = record
         target = self._target(xuid)
         if not self.enabled():
-            self.owner._save_state()
+            self.owner.save_state()
             return {"状态": "实时管理未启用", "XUID": xuid, "玩家名": name, "实际权限": observed["权限标志"], "权限类别": permission_category(observed["权限标志"])}
         if target is None:
-            self.owner._save_state()
+            self.owner.save_state()
             return {"状态": "未托管", "XUID": xuid, "玩家名": name, "实际权限": observed["权限标志"], "权限类别": permission_category(observed["权限标志"])}
         if observed["权限标志"] == target:
-            self.owner._save_state()
+            self.owner.save_state()
             return {"状态": "一致", "XUID": xuid, "玩家名": name, "实际权限": observed["权限标志"], "权限类别": permission_category(observed["权限标志"]), "目标权限": target}
         differences = compare_ability_flags(observed["权限标志"], target)
         now = time.monotonic()
@@ -175,7 +175,7 @@ class RealtimeManager:
         status = "已提交" if result.get("success") else "修正失败"
         runtime["最近权限修正"].append({"玩家XUID": xuid, "玩家名称": name, "实际权限": observed["权限标志"], "目标权限": target, "差异": differences, "状态": status, "触发原因": trigger, "时间": int(time.time())})
         runtime["最近权限修正"] = runtime["最近权限修正"][-1000:]
-        self.owner._save_state()
+        self.owner.save_state()
         self._emit("权限修正", XUID=xuid, 玩家名=name, 目标权限=target, 状态=status, 差异=differences)
         return {"状态": status, "XUID": xuid, "玩家名": name, "实际权限": observed["权限标志"], "权限类别": permission_category(observed["权限标志"]), "玩家权限等级": observed["玩家权限等级"], "命令权限等级": observed["命令权限等级"], "差异": differences, "目标权限": target, "结果": result}
 
@@ -191,7 +191,7 @@ class RealtimeManager:
         for player in current.values():
             results.append(self.inspect_player(player))
         if changed and not results:
-            self.owner._save_state()
+            self.owner.save_state()
         return results
 
     def handle_unknown_admins(self, admins: list[str]) -> list[dict[str, Any]]:
@@ -255,22 +255,31 @@ class RealtimeManager:
             values = runtime.get(key)
             if isinstance(values, dict):
                 values.pop(xuid, None)
-        self.owner._save_state()
+        self.owner.save_state()
 
     def start(self) -> bool:
         if self._thread and self._thread.is_alive():
             return False
         self._stop.clear()
         self._runtime()["是否运行"] = self.enabled()
-        self.owner._save_state()
+        self.owner.save_state()
         if not self.enabled():
             return False
         self._thread = threading.Thread(target=self._loop, name="libra-realtime-permission", daemon=True)
         self._thread.start()
         return True
 
+    def _interval(self) -> float:
+        """在线权限检查间隔，最少 0.2 秒。"""
+        return max(0.2, float(self._cfg().get("在线权限检查间隔(秒)", 1)))
+
+    def _check_admins_once(self) -> None:
+        """读取一次管理员列表，并按策略处理未授权管理员。"""
+        admins = self.owner.run_admin_list(show=False)
+        if self.owner.state.get("最近列表状态") == "成功":
+            self.handle_unknown_admins(admins)
+
     def _loop(self) -> None:
-        interval = lambda: max(0.2, float(self._cfg().get("在线权限检查间隔(秒)", 1)))
         last_admin_check = 0.0
         if bool(self._cfg().get("启动后立即检查", True)):
             try:
@@ -278,30 +287,28 @@ class RealtimeManager:
                 now = time.monotonic()
                 admin_interval = max(5.0, float(self._cfg().get("管理员列表检查间隔(秒)", 60)))
                 if now - last_admin_check >= admin_interval:
-                    admins = self.owner._run_list(show=False)
-                    if self.owner.state.get("最近列表状态") == "成功":
-                        self.handle_unknown_admins(admins)
+                    self._check_admins_once()
                     last_admin_check = now
             except Exception as exc:
-                self.owner._orion("ALERT", f"实时权限检查失败：{exc}")
-        while not self._stop.wait(interval()):
+                self.owner.log_orion("ALERT", f"实时权限检查失败：{exc}")
+        while not self._stop.wait(self._interval()):
             try:
                 self.inspect_players()
             except Exception as exc:
-                self.owner._orion("ALERT", f"实时权限检查失败：{exc}")
+                self.owner.log_orion("ALERT", f"实时权限检查失败：{exc}")
         self._runtime()["是否运行"] = False
-        self.owner._save_state()
+        self.owner.save_state()
 
     def stop(self) -> None:
         self._stop.set()
         self._runtime()["是否运行"] = False
-        self.owner._save_state()
+        self.owner.save_state()
 
     def set_enabled(self, enabled: bool) -> dict[str, Any]:
         group = self.owner.cfg.setdefault("实时管理", {})
         group["是否启用"] = bool(enabled)
         try:
-            self.owner._save_config()
+            self.owner.save_config()
         except Exception:
             pass
         if enabled:
@@ -316,7 +323,7 @@ class RealtimeManager:
         if synced is not None:
             current, changed = synced
             if changed:
-                self.owner._save_state()
+                self.owner.save_state()
             current_xuids = set(current)
             observations = runtime.get("权限观测", {})
             if not isinstance(observations, dict):
@@ -356,31 +363,31 @@ class RealtimeManager:
         result = self.owner.set_permission(normalized, target, actor=actor, reason="建立持续管理规则", management="manage")
         if not result.get("success"):
             return result
-        with self.owner._lock:
+        with self.owner.state_lock:
             managed = self.owner.state.setdefault("持续管理玩家", {})
             managed[normalized] = bool(enabled)
-            self.owner._save_state()
+            self.owner.save_state()
         return {**result, "持续管理": bool(enabled), "目标权限": target}
 
     def pause_managed_rule(self, xuid: str, actor: str = "api") -> dict[str, Any]:
         normalized = normalize_xuid(xuid)
-        with self.owner._lock:
+        with self.owner.state_lock:
             managed = self.owner.state.setdefault("持续管理玩家", {})
             if normalized not in managed:
                 return {"success": False, "error": "not_managed", "XUID": normalized}
             managed[normalized] = False
-            self.owner._save_state()
+            self.owner.save_state()
         self._emit("持续管理暂停", XUID=normalized, 操作人=actor)
         return {"success": True, "XUID": normalized, "持续管理": False}
 
     def remove_managed_rule(self, xuid: str, actor: str = "api") -> dict[str, Any]:
         normalized = normalize_xuid(xuid)
-        with self.owner._lock:
+        with self.owner.state_lock:
             managed = self.owner.state.setdefault("持续管理玩家", {})
             if normalized not in managed:
                 return {"success": False, "error": "not_managed", "XUID": normalized}
             managed.pop(normalized, None)
-            self.owner._save_state()
+            self.owner.save_state()
         self._emit("持续管理删除", XUID=normalized, 操作人=actor)
         return {"success": True, "XUID": normalized}
 
@@ -406,7 +413,7 @@ class RealtimeManager:
         if normalized not in managed:
             return {"success": False, "error": "not_managed", "XUID": normalized}
         managed[normalized] = bool(enabled)
-        self.owner._save_state()
+        self.owner.save_state()
         self._emit("持续管理状态变更", XUID=normalized, 是否启用=bool(enabled), 操作人=actor)
         return {"success": True, "XUID": normalized, "是否启用": bool(enabled)}
 
@@ -416,7 +423,7 @@ class RealtimeManager:
         runtime = self._runtime()
         synced = self._sync_online_cache()
         if synced is not None and synced[1]:
-            self.owner._save_state()
+            self.owner.save_state()
         current_xuids = set(synced[0]) if synced is not None else None
         observations = runtime.get("权限观测", {})
         if not isinstance(observations, dict):
@@ -442,6 +449,13 @@ class RealtimeManager:
             page, page_size = 1, 20
         start = (page - 1) * page_size
         return {"页码": page, "每页数量": page_size, "总数": len(rows), "项目": rows[start:start + page_size]}
+
+    def recent_fix_records(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """返回最近的权限修正记录，供控制台菜单渲染。"""
+        records = self._runtime().get("最近权限修正", [])
+        if not isinstance(records, list):
+            return []
+        return list(records[-limit:]) if limit else list(records)
 
     def subscribe(self, callback: Callable[[dict[str, Any]], Any]) -> int:
         self._callback_id += 1

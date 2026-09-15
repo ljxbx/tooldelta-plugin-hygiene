@@ -1,6 +1,8 @@
 """Libra 配置加载与默认值。"""
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 
@@ -39,47 +41,63 @@ class ConfigManager:
         self.plugin_name = plugin_name
         self.version = version
 
+    @staticmethod
+    def _defaults_copy() -> dict[str, Any]:
+        return {
+            key: (value.copy() if isinstance(value, (list, dict)) else value)
+            for key, value in DEFAULT_CONFIG.items()
+        }
+
+    @staticmethod
+    def _merge_with_defaults(source: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+        """把已保存的配置合并到默认值上，``实时管理`` 单独做一层合并。"""
+        merged = dict(defaults)
+        merged.update(source)
+        if isinstance(defaults.get("实时管理"), dict):
+            group = dict(defaults["实时管理"])
+            if isinstance(source.get("实时管理"), dict):
+                group.update(source["实时管理"])
+            merged["实时管理"] = group
+        return merged
+
+    def _upgrade(self, merged: dict[str, Any]) -> None:
+        if hasattr(self.cfg_module, "upgrade_plugin_config"):
+            self.cfg_module.upgrade_plugin_config(self.plugin_name, merged, self.version)
+
     def load(self) -> dict[str, Any]:
-        defaults = {key: (value.copy() if isinstance(value, (list, dict)) else value) for key, value in DEFAULT_CONFIG.items()}
+        defaults = self._defaults_copy()
         if self.cfg_module is None:
             return defaults
         try:
-            auto_to_std = getattr(self.cfg_module, "auto_to_std", None)
-            standard = auto_to_std(defaults) if callable(auto_to_std) else defaults
-            loaded, _ = self.cfg_module.get_plugin_config_and_version(
-                self.plugin_name, standard, defaults, self.version
+            return self._load_from_config_api(defaults)
+        except Exception:
+            return self._load_from_legacy_file(defaults)
+
+    def _load_from_config_api(self, defaults: dict[str, Any]) -> dict[str, Any]:
+        auto_to_std = getattr(self.cfg_module, "auto_to_std", None)
+        standard = auto_to_std(defaults) if callable(auto_to_std) else defaults
+        loaded, _ = self.cfg_module.get_plugin_config_and_version(
+            self.plugin_name, standard, defaults, self.version
+        )
+        if not isinstance(loaded, dict):
+            return defaults
+        merged = self._merge_with_defaults(loaded, defaults)
+        if set(merged) != set(loaded):
+            self._upgrade(merged)
+        return merged
+
+    def _load_from_legacy_file(self, defaults: dict[str, Any]) -> dict[str, Any]:
+        """旧版配置可能因缺少新键而无法通过严格校验；尽量读取其配置项并补齐默认值。"""
+        try:
+            root = self.cfg_module.TOOLDELTA_PLUGIN_CFG_DIR
+            raw = json.loads(
+                (Path(root) / f"{self.plugin_name}.json").read_text(encoding="utf-8")
             )
-            if not isinstance(loaded, dict):
+            old = raw.get("配置项", raw) if isinstance(raw, dict) else {}
+            if not isinstance(old, dict):
                 return defaults
-            merged = dict(defaults)
-            merged.update(loaded)
-            if isinstance(defaults.get("实时管理"), dict):
-                group = dict(defaults["实时管理"])
-                if isinstance(loaded.get("实时管理"), dict):
-                    group.update(loaded["实时管理"])
-                merged["实时管理"] = group
-            if set(merged) != set(loaded) and hasattr(self.cfg_module, "upgrade_plugin_config"):
-                self.cfg_module.upgrade_plugin_config(self.plugin_name, merged, self.version)
+            merged = self._merge_with_defaults(old, defaults)
+            self._upgrade(merged)
             return merged
         except Exception:
-            # 旧版配置可能因缺少新键而无法通过严格校验；尽量读取其配置项并补齐默认值。
-            try:
-                root = getattr(self.cfg_module, "TOOLDELTA_PLUGIN_CFG_DIR")
-                import json
-                from pathlib import Path
-                raw = json.loads((Path(root) / f"{self.plugin_name}.json").read_text(encoding="utf-8"))
-                old = raw.get("配置项", raw) if isinstance(raw, dict) else {}
-                if isinstance(old, dict):
-                    merged = dict(defaults)
-                    merged.update(old)
-                    if isinstance(defaults.get("实时管理"), dict):
-                        group = dict(defaults["实时管理"])
-                        if isinstance(old.get("实时管理"), dict):
-                            group.update(old["实时管理"])
-                        merged["实时管理"] = group
-                    if hasattr(self.cfg_module, "upgrade_plugin_config"):
-                        self.cfg_module.upgrade_plugin_config(self.plugin_name, merged, self.version)
-                    return merged
-            except Exception:
-                pass
             return defaults
