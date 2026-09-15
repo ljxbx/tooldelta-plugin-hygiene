@@ -1,0 +1,2 @@
+# 统一按 LF 存储与检出，避免 Windows 上 CRLF 抖动污染 diff
+* text=auto eol=lf
