@@ -125,12 +125,16 @@ class ServerPermissionManager(ConsoleMenuMixin, PermissionService, IdentityIndex
         )
 
     def on_active(self) -> None:
-        threading.Thread(
-            target=self._run_list,
-            kwargs={"show": False},
-            name="libra-startup-refresh",
-            daemon=True,
-        ).start()
+        realtime_cfg = self.cfg.get("实时管理", {})
+        realtime_enabled = isinstance(realtime_cfg, dict) and bool(realtime_cfg.get("是否启用", False))
+        immediate_check = bool(realtime_cfg.get("启动后立即检查", True)) if isinstance(realtime_cfg, dict) else True
+        if not realtime_enabled or immediate_check:
+            threading.Thread(
+                target=self._run_list,
+                kwargs={"show": False},
+                name="libra-startup-refresh",
+                daemon=True,
+            ).start()
         self.realtime.start()
 
     def on_player_join(self, player: Any) -> None:

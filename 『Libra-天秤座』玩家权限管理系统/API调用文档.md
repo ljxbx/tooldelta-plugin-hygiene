@@ -172,7 +172,7 @@ result = self.libra.list_admin_details()
 
 `name` 由前置插件 `XUID获取` 的在线/离线身份数据解析；无法解析时为 `None`。
 
-### 5.3 `set_permission_flags(xuid, flags, actor="api", reason="", management="once")`
+### 5.3 `set_permission_flags(xuid, flags=None, actor="api", reason="", management="once")`
 
 设置玩家权限，支持在线和离线玩家。
 
@@ -190,7 +190,7 @@ result = self.libra.set_permission_flags(
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `xuid` | `str` | 必填 | 8-32 位十六进制 XUID |
-| `flags` | `str` | 必填 | 8 位 `0/1` 权限字符串 |
+| `flags` | `str | None` | `None` | 8 位 `0/1` 权限字符串；省略时使用配置项 `默认权限` |
 | `actor` | `str` | `"api"` | 操作者标识，写入操作记录 |
 | `reason` | `str` | `""` | 操作原因，写入操作记录 |
 | `management` | `str` | `"once"` | `once` 一次设置，`manage` 设置并建立持续管理规则，`auto` 供实时修正内部使用 |
@@ -351,11 +351,11 @@ result = self.libra.delete_snapshot_api(3, actor="备份插件")
 
 ## 7. 实时权限管理 API
 
-实时管理基于 ToolDelta 在线 `Player` 对象的 `abilities` 属性读取八项能力，不依赖 NeOmega。它只会持续修正已建立持续管理规则的玩家；未托管玩家不会因为普通在线检查而被修改。
+实时管理基于 ToolDelta 在线 `Player` 对象的 `abilities` 属性读取八项能力，不依赖 NeOmega。它只会持续修正已建立持续管理规则的玩家；未托管玩家不会因为普通在线检查而被修改。实时线程分别按 `在线权限检查间隔(秒)` 检查在线能力、按 `管理员列表检查间隔(秒)` 查询管理员列表并执行未授权管理员策略；`启动后立即检查` 控制这两类检查是否在启动时立即执行。
 
 ### 7.1 `get_realtime_status()`
 
-返回实时管理状态，包括是否启用、是否运行、实时在线人数、权限观测数和最近修正数。
+返回实时管理状态，包括是否启用、是否运行、实时在线人数、权限观测数、最近修正数和当前两类检查间隔。
 
 ```python
 status = self.libra.get_realtime_status()
@@ -486,7 +486,7 @@ token = self.libra.subscribe_permission_events(on_libra_event)
 | `事件` | 事件名称 |
 | `时间` | Unix 时间戳 |
 
-当前事件名称包括：`权限修正`、`未授权管理员`、`持续管理暂停`、`持续管理删除`、`持续管理状态变更`。
+当前事件名称包括：`权限修正`、`权限复核`、`未授权管理员`、`持续管理暂停`、`持续管理删除`、`持续管理状态变更`。自动修正成功后会在 `修改后复核延迟(秒)` 之后复核，最长等待 `修改后复核超时时间(秒)`，并通过 `权限复核` 事件报告 `通过` 或 `超时`。
 
 ### 9.2 `subscribe_unknown_admin_events(callback)`
 
@@ -534,6 +534,8 @@ self.libra.unsubscribe_permission_events(token)
 3. `list_admins(refresh=False)`、`get_status()` 和权限观测读取属于缓存读取，不会重新查询服务器。
 4. 事件回调在 Libra 内部触发。回调应快速返回；耗时任务请由调用方自行放入线程或任务队列。
 5. 关闭 ToolDelta 时 Libra 会停止实时管理线程并保存状态。调用方不应直接操作 Libra 的持久化文件。
+
+实时权限变更还遵循以下配置：`权限修改最小间隔(秒)`限制连续写入速度；自动/托管变更失败后按 `失败重试次数` 和 `失败重试间隔(秒)`重试；操作记录和实时修正记录最多保留 `处理记录保留条数` 条。`默认权限`用于调用 `set_permission_flags()` 时省略 `flags` 的情况。
 
 ## 11. 推荐的完整调用示例
 

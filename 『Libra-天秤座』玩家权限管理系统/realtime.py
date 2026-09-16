@@ -21,6 +21,8 @@ class RealtimeManager:
         self._callback_id = 0
         self._last_write: dict[str, float] = {}
         self._lock = threading.RLock()
+        self._verification_xuids: set[str] = set()
+        self._verification_lock = threading.RLock()
 
     def _cfg(self) -> dict[str, Any]:
         value = self.owner.cfg.get("实时管理", {})
@@ -174,9 +176,12 @@ class RealtimeManager:
         result = self.owner.set_permission(xuid, target, actor="realtime", reason="在线能力不一致", management="auto")
         status = "已提交" if result.get("success") else "修正失败"
         runtime["最近权限修正"].append({"玩家XUID": xuid, "玩家名称": name, "实际权限": observed["权限标志"], "目标权限": target, "差异": differences, "状态": status, "触发原因": trigger, "时间": int(time.time())})
-        runtime["最近权限修正"] = runtime["最近权限修正"][-1000:]
+        limit = self._record_limit()
+        runtime["最近权限修正"] = runtime["最近权限修正"][-limit:] if limit else []
         self.owner.save_state()
         self._emit("权限修正", XUID=xuid, 玩家名=name, 目标权限=target, 状态=status, 差异=differences)
+        if result.get("success"):
+            self._schedule_verification(xuid, name, target)
         return {"状态": status, "XUID": xuid, "玩家名": name, "实际权限": observed["权限标志"], "权限类别": permission_category(observed["权限标志"]), "玩家权限等级": observed["玩家权限等级"], "命令权限等级": observed["命令权限等级"], "差异": differences, "目标权限": target, "结果": result}
 
     def inspect_players(self) -> list[dict[str, Any]]:
@@ -274,7 +279,94 @@ class RealtimeManager:
 
     def _interval(self) -> float:
         """在线权限检查间隔，最少 0.2 秒。"""
-        return max(0.2, float(self._cfg().get("在线权限检查间隔(秒)", 1)))
+        try:
+            return max(0.2, float(self._cfg().get("在线权限检查间隔(秒)", 1)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _admin_interval(self) -> float:
+        """管理员列表检查间隔，最少 0.2 秒。"""
+        try:
+            return max(0.2, float(self._cfg().get("管理员列表检查间隔(秒)", 1)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _record_limit(self) -> int:
+        try:
+            return max(0, int(self._cfg().get("处理记录保留条数", 1000)))
+        except (TypeError, ValueError):
+            return 1000
+
+    def _verification_delay(self) -> float:
+        try:
+            return max(0.0, float(self._cfg().get("修改后复核延迟(秒)", 1)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _verification_timeout(self) -> float:
+        try:
+            return max(0.0, float(self._cfg().get("修改后复核超时时间(秒)", 5)))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def _schedule_verification(self, xuid: str, name: str, target: str) -> None:
+        """Verify an automatic write after the server has applied the change."""
+        with self._verification_lock:
+            if xuid in self._verification_xuids:
+                return
+            self._verification_xuids.add(xuid)
+
+        def run() -> None:
+            try:
+                if self._stop.wait(self._verification_delay()):
+                    return
+                deadline = time.monotonic() + self._verification_timeout()
+                last_actual: str | None = None
+                while not self._stop.is_set():
+                    players = self._get_current_players() or []
+                    player = next(
+                        (item for item in players if str(getattr(item, "xuid", "")).strip().lower() == xuid),
+                        None,
+                    )
+                    if player is None:
+                        reason = "玩家已离线"
+                    else:
+                        observed = read_player_abilities(player)
+                        last_actual = observed.get("权限标志")
+                        if observed.get("就绪") and last_actual == target:
+                            self._emit(
+                                "权限复核",
+                                XUID=xuid,
+                                玩家名=name,
+                                目标权限=target,
+                                实际权限=last_actual,
+                                状态="通过",
+                            )
+                            return
+                        reason = "能力尚未同步" if not observed.get("就绪") else "实际权限仍不一致"
+                    if time.monotonic() >= deadline:
+                        self._emit(
+                            "权限复核",
+                            XUID=xuid,
+                            玩家名=name,
+                            目标权限=target,
+                            实际权限=last_actual,
+                            状态="超时",
+                            原因=reason,
+                        )
+                        return
+                    wait_for = min(0.5, self._interval(), max(0.05, deadline - time.monotonic()))
+                    if self._stop.wait(wait_for):
+                        return
+            finally:
+                with self._verification_lock:
+                    self._verification_xuids.discard(xuid)
+
+        threading.Thread(
+            target=run,
+            name=f"libra-permission-verify-{xuid}",
+            daemon=True,
+        ).start()
 
     def _check_admins_once(self) -> None:
         """读取一次管理员列表，并按策略处理未授权管理员。"""
@@ -283,22 +375,26 @@ class RealtimeManager:
             self.handle_unknown_admins(admins)
 
     def _loop(self) -> None:
-        last_admin_check = 0.0
-        if bool(self._cfg().get("启动后立即检查", True)):
-            try:
-                self.inspect_players()
-                now = time.monotonic()
-                admin_interval = max(0.2, float(self._cfg().get("管理员列表检查间隔(秒)", 1)))
-                if now - last_admin_check >= admin_interval:
+        immediate = bool(self._cfg().get("启动后立即检查", True))
+        now = time.monotonic()
+        next_online = now if immediate else now + self._interval()
+        next_admin = now if immediate else now + self._admin_interval()
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if now >= next_online:
+                try:
+                    self.inspect_players()
+                except Exception as exc:
+                    self.owner.log_orion("ALERT", f"实时在线权限检查失败：{exc}")
+                next_online = now + self._interval()
+            if now >= next_admin:
+                try:
                     self._check_admins_once()
-                    last_admin_check = now
-            except Exception as exc:
-                self.owner.log_orion("ALERT", f"实时权限检查失败：{exc}")
-        while not self._stop.wait(self._interval()):
-            try:
-                self.inspect_players()
-            except Exception as exc:
-                self.owner.log_orion("ALERT", f"实时权限检查失败：{exc}")
+                except Exception as exc:
+                    self.owner.log_orion("ALERT", f"实时管理员列表检查失败：{exc}")
+                next_admin = now + self._admin_interval()
+            wait_for = max(0.05, min(next_online - time.monotonic(), next_admin - time.monotonic()))
+            self._stop.wait(wait_for)
         self._runtime()["是否运行"] = False
         self.owner.save_state()
 
@@ -355,6 +451,8 @@ class RealtimeManager:
             "权限观测数": observed_count,
             "已就绪观测数": ready_count,
             "在线数据来源": data_source,
+            "在线权限检查间隔(秒)": self._interval(),
+            "管理员列表检查间隔(秒)": self._admin_interval(),
             "待处理数量": len(runtime.get("待处理权限动作", [])),
             "最近修正数量": len(runtime.get("最近权限修正", [])),
         }

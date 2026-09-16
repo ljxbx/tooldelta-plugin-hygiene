@@ -15,6 +15,78 @@ except ImportError:
 
 
 class PermissionService:
+    #: 上一次权限写命令的时间戳，用于全局节流；类级声明避免 PYL-W0201。
+    _last_mutation_time: float = 0.0
+
+    def _realtime_cfg(self) -> dict[str, Any]:
+        value = getattr(self, "cfg", {}).get("实时管理", {})
+        return value if isinstance(value, dict) else {}
+
+    def _mutation_interval(self) -> float:
+        try:
+            return max(0.0, float(self._realtime_cfg().get("权限修改最小间隔(秒)", 0.5)))
+        except (TypeError, ValueError):
+            return 0.5
+
+    def _retry_count(self, management: str) -> int:
+        # Automatic and managed updates are retried; one-off operator commands
+        # remain single-shot so the console receives an immediate result.
+        if management not in {"auto", "manage"}:
+            return 0
+        try:
+            return max(0, int(self._realtime_cfg().get("失败重试次数", 2)))
+        except (TypeError, ValueError):
+            return 2
+
+    def _retry_interval(self) -> float:
+        try:
+            return max(0.0, float(self._realtime_cfg().get("失败重试间隔(秒)", 5)))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def _wait_mutation_interval(self) -> None:
+        """Throttle permission writes globally, including retry attempts."""
+        interval = self._mutation_interval()
+        last = self._last_mutation_time
+        wait_for = interval - (time.monotonic() - last)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        self._last_mutation_time = time.monotonic()
+
+    def _send_mutation(self, command: str, management: str) -> dict[str, Any]:
+        """Send a permission mutation with configured pacing and retries."""
+        retries = self._retry_count(management)
+        last_output: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            self._wait_mutation_interval()
+            try:
+                output = self._send(command)
+            except Exception as exc:
+                last_error = exc
+                if attempt >= retries:
+                    raise
+            else:
+                last_error = None
+                last_output = output
+                if output.get("success") and output.get("confirmed"):
+                    return output
+            if attempt < retries:
+                time.sleep(self._retry_interval())
+        if last_error is not None:
+            raise last_error
+        return last_output or {"success": False, "error_code": "command_failed"}
+
+    def _record_limit(self) -> int:
+        try:
+            return max(0, int(self._realtime_cfg().get("处理记录保留条数", 1000)))
+        except (TypeError, ValueError):
+            return 1000
+
+    def _default_flags(self) -> str:
+        value = getattr(self, "cfg", {}).get("默认权限", "11111100")
+        return str(value) if value is not None else "11111100"
+
     def _use_magic_command(self) -> bool:
         value = self.cfg.get("是否使用魔法指令模式运行", True)
         if isinstance(value, str):
@@ -138,12 +210,13 @@ class PermissionService:
             self.state.setdefault("操作记录", []).append(
                 {"操作": "设置权限", **record, "响应": output}
             )
-            self.state["操作记录"] = self.state["操作记录"][-1000:]
+            limit = self._record_limit()
+            self.state["操作记录"] = self.state["操作记录"][-limit:] if limit else []
             self._save_state()
 
-    def set_permission(self, xuid: str, flags: str, actor: str = "api", reason: str = "", management: str = "once") -> dict[str, Any]:
+    def set_permission(self, xuid: str, flags: str | None = None, actor: str = "api", reason: str = "", management: str = "once") -> dict[str, Any]:
         normalized = normalize_xuid(xuid)
-        parsed = parse_flags(flags)
+        parsed = parse_flags(self._default_flags() if flags is None else flags)
         if management == "once":
             conflict = self._managed_player_conflict(normalized)
             if conflict is not None:
@@ -152,7 +225,7 @@ class PermissionService:
         if not self._mutation_lock.acquire(blocking=False):
             return {"success": False, "error": "busy", "message": "已有权限变更正在执行"}
         try:
-            output = self._send(command)
+            output = self._send_mutation(command, management)
         except Exception as exc:
             self._audit("set_failed", xuid=normalized, flags=parsed.raw, actor=actor, error=str(exc))
             return {"success": False, "error": "command_failed", "message": str(exc), "xuid": normalized}
@@ -175,13 +248,19 @@ class PermissionService:
         )
         return {"success": True, "action": "set", "xuid": normalized, "flags": parsed.raw, "response": output}
 
-    def revoke_permission(self, xuid: str, actor: str = "api", reason: str = "") -> dict[str, Any]:
+    def revoke_permission(
+        self,
+        xuid: str,
+        actor: str = "api",
+        reason: str = "",
+        management: str = "once",
+    ) -> dict[str, Any]:
         normalized = normalize_xuid(xuid)
         command = build_delete_command(normalized)
         if not self._mutation_lock.acquire(blocking=False):
             return {"success": False, "error": "busy", "message": "已有权限变更正在执行"}
         try:
-            output = self._send(command)
+            output = self._send_mutation(command, management)
         except Exception as exc:
             self._audit("revoke_failed", xuid=normalized, actor=actor, error=str(exc))
             return {"success": False, "error": "command_failed", "message": str(exc), "xuid": normalized}
@@ -197,7 +276,8 @@ class PermissionService:
             self.state.setdefault("操作记录", []).append(
                 {"操作": "撤销权限", "xuid": normalized, "actor": actor, "reason": reason, "响应": output}
             )
-            self.state["操作记录"] = self.state["操作记录"][-1000:]
+            limit = self._record_limit()
+            self.state["操作记录"] = self.state["操作记录"][-limit:] if limit else []
             self._save_state()
         self._audit("撤销权限", command=command, response=output, xuid=normalized, actor=actor, reason=reason)
         return {"success": True, "action": "revoke", "xuid": normalized, "response": output}
