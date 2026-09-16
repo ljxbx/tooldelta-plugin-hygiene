@@ -1,27 +1,7 @@
 version = 1
 
-# 仓库里只放目标插件，所以这里不需要大范围 exclude，
-# 只挡掉不该被分析的产物文件。
-exclude_patterns = [
-  "**/__pycache__/**",
-  "**/*.pyc",
-]
-
 [[analyzers]]
 name = "python"
-enabled = true
 
   [analyzers.meta]
   runtime_version = "3.x.x"
-
-  # 行长上限。默认 88（Black 标准）。
-  # 实测『Libra』超过 88 字符的行有 118 行，超过 100 的有 64 行。
-  # 这里放宽到 100 以减少纯风格噪音；想要严格 PEP 8 就改回 88。
-  max_line_length = 100
-
-  # 文档覆盖率豁免项。
-  # magic = 魔术方法（__eq__ 之类），init = __init__，
-  # 这两类不写 docstring 是通行做法，豁免掉。
-  # 其余（模块 / 类 / 公开函数与方法）保留检查，
-  # 因为这两个插件本来 docstring 风格就不错，缺的补上成本很低。
-  skip_doc_coverage = ["magic", "init"]
