@@ -25,6 +25,7 @@ class StateStore:
         "response": "响应",
         "command": "命令",
         "admins": "管理员",
+        "configured": "配置管理员",
         "unknown": "未知管理员",
         "trusted": "受信任管理员",
         "protected": "受保护管理员",

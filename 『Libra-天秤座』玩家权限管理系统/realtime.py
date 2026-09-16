@@ -201,8 +201,11 @@ class RealtimeManager:
         except (TypeError, ValueError):
             policy = 0
         policy = policy if policy in {0, 1, 2} else 0
-        trusted = {str(x).strip().lower() for x in self.owner.cfg.get("受信任管理员XUID", [])}
-        protected = {str(x).strip().lower() for x in self.owner.cfg.get("保护管理员XUID", [])}
+        configured = {
+            str(x).strip().lower()
+            for x in self._cfg().get("管理员XUID", [])
+            if str(x).strip()
+        }
         flags = {1: "11111100", 2: "00000000"}.get(policy)
         policy_name = {0: "仅提醒", 1: "设为成员", 2: "设为访客"}[policy]
         results = []
@@ -211,7 +214,7 @@ class RealtimeManager:
                 normalized = normalize_xuid(xuid)
             except ValueError:
                 continue
-            if normalized in trusted or normalized in protected or self._managed(normalized):
+            if normalized in configured or self._managed(normalized):
                 continue
             name = None
             try:
@@ -285,7 +288,7 @@ class RealtimeManager:
             try:
                 self.inspect_players()
                 now = time.monotonic()
-                admin_interval = max(5.0, float(self._cfg().get("管理员列表检查间隔(秒)", 60)))
+                admin_interval = max(0.2, float(self._cfg().get("管理员列表检查间隔(秒)", 1)))
                 if now - last_admin_check >= admin_interval:
                     self._check_admins_once()
                     last_admin_check = now

@@ -207,10 +207,20 @@ class PermissionService:
         observed = set(self._run_list(show=False))
         if self.state.get("最近列表状态") != "成功":
             return {"success": False, "error": self.state.get("最近列表错误") or "list_failed", "admins": sorted(observed)}
-        trusted = {str(x).lower() for x in self.cfg.get("受信任管理员XUID", [])}
-        trusted.update(str(x).lower() for x in self.cfg.get("保护管理员XUID", []))
-        unknown = sorted(observed - trusted)
-        result = {"success": True, "admins": sorted(observed), "unknown": unknown, "trusted": sorted(trusted)}
+        configured = {
+            str(x).strip().lower()
+            for x in self.cfg.get("实时管理", {}).get("管理员XUID", [])
+            if str(x).strip()
+        }
+        unknown = sorted(observed - configured)
+        result = {
+            "success": True,
+            "admins": sorted(observed),
+            "unknown": unknown,
+            "configured": sorted(configured),
+            # Compatibility alias: all configured XUIDs now share one policy.
+            "trusted": sorted(configured),
+        }
         self._audit("audit", **result)
         return result
 
@@ -218,17 +228,30 @@ class PermissionService:
     def preview_sync(self, refresh: bool = True) -> dict[str, Any]:
         observed = set(self.list_permissions(refresh=refresh))
         if refresh and self.state.get("最近列表状态") != "成功":
-            return {"success": False, "error": self.state.get("最近列表错误") or "list_failed", "to_set": [], "to_delete": [], "unknown": [], "protected": []}
+            return {
+                "success": False,
+                "error": self.state.get("最近列表错误") or "list_failed",
+                "to_set": [],
+                "to_delete": [],
+                "unknown": [],
+                "configured": [],
+                "protected": [],
+            }
         desired = dict(self.state.get("期望权限", {}))
         diff = plan_admin_diff(desired, observed)
-        trusted = {str(x).lower() for x in self.cfg.get("受信任管理员XUID", [])}
-        protected = {str(x).lower() for x in self.cfg.get("保护管理员XUID", [])}
-        unknown = sorted(observed - trusted - protected)
+        configured = {
+            str(x).strip().lower()
+            for x in self.cfg.get("实时管理", {}).get("管理员XUID", [])
+            if str(x).strip()
+        }
+        unknown = sorted(observed - configured)
         return {
             "to_set": [{"xuid": xuid, "flags": flags} for xuid, flags in diff.to_set],
             "to_delete": list(diff.to_delete),
             "unknown": unknown,
-            "protected": sorted(protected),
+            "configured": sorted(configured),
+            # Compatibility alias: there is no separate protected list anymore.
+            "protected": sorted(configured),
         }
 
     # 保留程序化 API，控制台入口已移除。
@@ -238,11 +261,15 @@ class PermissionService:
             return {"success": False, "error": plan.get("error", "list_failed"), "plan": plan, "results": []}
         results = [self.set_permission(item["xuid"], item["flags"], actor=actor) for item in plan["to_set"]]
         if remove_unknown:
-            protected = {str(x).lower() for x in self.cfg.get("保护管理员XUID", [])}
+            configured = {
+                str(x).strip().lower()
+                for x in self.cfg.get("实时管理", {}).get("管理员XUID", [])
+                if str(x).strip()
+            }
             results.extend(
                 self.revoke_permission(xuid, actor=actor, reason="未知管理员清理")
                 for xuid in plan["unknown"]
-                if xuid not in protected
+                if xuid not in configured
             )
         self._audit("sync", actor=actor, remove_unknown=remove_unknown, results=results)
         return {"success": all(item.get("success", False) for item in results), "plan": plan, "results": results}
