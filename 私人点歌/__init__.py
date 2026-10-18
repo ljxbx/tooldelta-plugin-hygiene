@@ -496,10 +496,11 @@ class PersonalSongRequest(Plugin):
             可安全用作文件名的本地曲名。
         """
         base = self.make_safe_song_name(song.title)
-        entry = self.network_index.get(base)
-        if entry is not None and str(entry.get("id")) == song.song_id:
+        # 变量名避开模块级的 entry（插件入口），否则会遮蔽外层同名
+        index_entry = self.network_index.get(base)
+        if index_entry is not None and str(index_entry.get("id")) == song.song_id:
             return base
-        if entry is None and base not in self.local_songs:
+        if index_entry is None and base not in self.local_songs:
             return base
         short = self.make_safe_song_name(song.title[:60])
         return self.make_safe_song_name(f"{short}_{song.song_id[-6:]}")
@@ -793,7 +794,9 @@ class PersonalSongRequest(Plugin):
             self.play_song_for_player(player, matches[0])
             return
         if matches:
-            chosen = self.choose_local_song(player, matches, f"匹配: {keyword}")
+            chosen = self.choose_local_song(
+                player, matches, f"本地歌曲点歌 - 匹配: {keyword}"
+            )
             if chosen is not None:
                 self.play_song_for_player(player, chosen)
             return
@@ -883,13 +886,17 @@ class PersonalSongRequest(Plugin):
             self.play_song_for_player(player, selected_song)
 
     def choose_local_song(
-        self, player: Player, source_songs: list[str] | None = None
+        self,
+        player: Player,
+        source_songs: list[str] | None = None,
+        title: str | None = None,
     ) -> str | None:
         """分页展示本地歌曲并让玩家选择，支持模糊搜索。
 
         Args:
             player: 选择的玩家。
             source_songs: 候选曲名；默认使用整个本地曲库。
+            title: 自定义菜单标题；留空时按是否有搜索关键词自动生成。
 
         Returns:
             选中的曲名；退出或超时返回 None。
@@ -913,7 +920,9 @@ class PersonalSongRequest(Plugin):
             page_songs, current_page, total_pages = self.get_page_items(
                 songs, current_page, self.page_size
             )
-            header = "本地歌曲点歌" if not keyword else f"本地歌曲点歌 - 搜索: {keyword}"
+            header = title or (
+                "本地歌曲点歌" if not keyword else f"本地歌曲点歌 - 搜索: {keyword}"
+            )
             player.show(self.menu_header(header))
             for index, song_name in enumerate(page_songs, start=1):
                 player.show(f"§l§b[ §e{index} §b] §f- §7{song_name}")
